@@ -96,7 +96,7 @@ ch_output_docs = file("$baseDir/docs/output.md", checkIfExists: true)
 /*
  * Create a channel for input read files
  */
-asm_ch = Channel.fromFilePairs(params.assemblies, size: 1)
+asm_ch = Channel.fromPath(params.assemblies)
 
 // Header log info
 log.info nfcoreHeader()
@@ -177,17 +177,18 @@ process get_software_versions {
  * ABRICATE
  */
 process abricate {
-    publishDir "${params.outdir}/abricate", mode: 'copy'
+    publishDir "${params.outdir}/abricate/${file(fasta).getBaseName()}", mode: 'copy'
 
     input:
-    tuple(sample_id, path(fasta)) from asm_ch
+    path(fasta) from asm_ch
 
     output:
-    tuple(path(fasta), path("${sample_id}_amr.tab")) into amr_ch
+    tuple(path(fasta), path("plm_genes.txt")) into amr_ch
 
     script:
     """
-    abricate --threads ${task.cpus} $fasta --db ncbi > ${sample_id}_amr.tab
+    abricate --threads ${task.cpus} $fasta --db ncbi > ${file(fasta).getBaseName()}.amr.tab
+    cat ${file(fasta).getBaseName()}.amr.tab | awk 'FNR > 1 { print \$6}' > plm_genes.txt
     """
     
 }
@@ -196,26 +197,24 @@ process sort_genes {
     publishDir "${params.outdir}/genes", mode: 'copy'
 
     input:
-    tuple(path(fasta), path(amr_file)) from amr_ch
+    tuple(path(fasta), path(genes)) from amr_ch
     
     output:
     path("*/*.fasta")
 
     script:
-    if (!file(fasta).isEmpty())
-        """
-        cat $amr_file | awk 'FNR > 1 { print \$6}' > plm_genes.txt
-    
-        while read p
-        do
-        mkdir -p \$p
-        cp $fasta \$p
-        done < plm_genes.txt
-        """
-    else
+    if (genes.empty())
         """
         mkdir -p no_AMR
         cp $fasta no_AMR/
+        """
+    else
+        """
+        while read p 
+        do 
+        mkdir -p \$p 
+        cp ${fasta} \$p 
+        done < ${genes}
         """
 }
 
