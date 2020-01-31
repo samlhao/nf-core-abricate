@@ -21,7 +21,7 @@ def helpMessage() {
     nextflow run nf-core/abricate --reads '*_R{1,2}.fastq.gz' -profile docker
 
     Mandatory arguments:
-      --reads                       Path to input data (must be surrounded with quotes)
+      --assemblies                  Path to input data (must be surrounded with quotes)
       -profile                      Configuration profile to use. Can use multiple (comma separated)
                                     Available: conda, docker, singularity, awsbatch, test and more.
 
@@ -95,26 +95,7 @@ ch_output_docs = file("$baseDir/docs/output.md", checkIfExists: true)
 /*
  * Create a channel for input read files
  */
-if (params.readPaths) {
-    if (params.singleEnd) {
-        Channel
-            .from(params.readPaths)
-            .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true) ] ] }
-            .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { read_files_fastqc; read_files_trimming }
-    } else {
-        Channel
-            .from(params.readPaths)
-            .map { row -> [ row[0], [ file(row[1][0], checkIfExists: true), file(row[1][1], checkIfExists: true) ] ] }
-            .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { read_files_fastqc; read_files_trimming }
-    }
-} else {
-    Channel
-        .fromFilePairs( params.reads, size: params.singleEnd ? 1 : 2 )
-        .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
-        .into { read_files_fastqc; read_files_trimming }
-}
+asm_ch = Channel.fromFilePairs(params.assemblies, size: 1)
 
 // Header log info
 log.info nfcoreHeader()
@@ -194,51 +175,49 @@ process get_software_versions {
 }
 
 /*
- * STEP 1 - FastQC
+ * ABRICATE
  */
-process fastqc {
-    tag "$name"
-    label 'process_medium'
-    publishDir "${params.outdir}/fastqc", mode: 'copy',
-        saveAs: { filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename" }
+process abricate {
+    publishDir "${params.outdir}/abricate", mode: 'copy'
 
     input:
-    set val(name), file(reads) from read_files_fastqc
+    tuple(sample_id, path(fasta)) from asm_ch
 
     output:
-    file "*_fastqc.{zip,html}" into fastqc_results
+    tuple(path(fasta), path("${sample_id}_amr.tab")) into amr_ch
 
     script:
     """
-    fastqc --quiet --threads $task.cpus $reads
+    abricate --threads ${task.cpus} $fasta --db ncbi > ${sample_id}_amr.tab
     """
+    
 }
 
-/*
- * STEP 2 - MultiQC
- */
-process multiqc {
-    publishDir "${params.outdir}/MultiQC", mode: 'copy'
+process sort_genes {
+    publishDir "${params.outdir}/genes", mode: 'copy'
 
     input:
-    file multiqc_config from ch_multiqc_config
-    // TODO nf-core: Add in log files from your new processes for MultiQC to find!
-    file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
-    file ('software_versions/*') from software_versions_yaml.collect()
-    file workflow_summary from create_workflow_summary(summary)
-
+    tuple(path(fasta), path(amr_file)) from amr_ch
+    
     output:
-    file "*multiqc_report.html" into multiqc_report
-    file "*_data"
-    file "multiqc_plots"
+    path("*/*.fasta")
 
     script:
-    rtitle = custom_runName ? "--title \"$custom_runName\"" : ''
-    rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
-    // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
-    """
-    multiqc -f $rtitle $rfilename --config $multiqc_config .
-    """
+    if (!file(fasta).isEmpty())
+        """
+        cat $amr_file | awk 'FNR > 1 { print \$6}' > plm_genes.txt
+    
+        while read p
+        do
+        mkdir -p \$p
+        cp $fasta \$p
+        done < plm_genes.txt
+        """
+    else
+        """
+        mkdir -p no_AMR
+        cp $fasta no_AMR/
+        """
 }
 
 /*
