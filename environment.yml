@@ -12,3 +12,5 @@ dependencies:
   - conda-forge::r-markdown=1.1
   - conda-forge::r-base=3.6.1
   - abricate
+  - fastp=0.20.0
+  - unicycler

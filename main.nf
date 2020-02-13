@@ -26,6 +26,8 @@ def helpMessage() {
                                     Available: conda, docker, singularity, awsbatch, test and more.
 
     Options:
+      --reads                       Path to reads if need to assemble
+      --unicycler_args              Extra Unicycler arguments
       --genome                      Name of iGenomes reference
       --singleEnd                   Specifies that the input is single end reads
 
@@ -96,7 +98,26 @@ ch_output_docs = file("$baseDir/docs/output.md", checkIfExists: true)
 /*
  * Create a channel for input read files
  */
-asm_ch = Channel.fromPath(params.assemblies)
+if (params.assemblies) {
+    Channel
+        .fromPath(params.assemblies)
+        .set{asm_ch}
+} else {
+    Channel
+        .empty()
+        .set{asm_ch}
+}
+
+if (params.reads) {
+   Channel
+        .fromFilePairs( params.reads, size: params.singleEnd ? 1 : 2 )
+        .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
+        .into { read_files_fastqc; read_files_trimming }
+} else {
+    Channel
+        .empty()
+        .set { assembled_ch }
+}
 
 // Header log info
 log.info nfcoreHeader()
@@ -174,13 +195,130 @@ process get_software_versions {
 }
 
 /*
+ * STEP 1 - FastQC
+ */
+process fastqc {
+    tag "$name"
+    label 'process_medium'
+    publishDir "${params.outdir}/fastqc", mode: 'copy',
+        saveAs: { filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename" }
+
+    input:
+    set val(name), file(reads) from read_files_fastqc
+
+    output:
+    file "*_fastqc.{zip,html}" into fastqc_results
+
+    when:
+    params.reads
+
+    script:
+    """
+    fastqc --threads $task.cpus $reads
+    """
+}
+
+/*
+ * STEP 2 - MultiQC
+ */
+process multiqc {
+    publishDir "${params.outdir}/MultiQC", mode: 'copy'
+
+    input:
+    file multiqc_config from ch_multiqc_config
+    // TODO nf-core: Add in log files from your new processes for MultiQC to find!
+    file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
+    file ('software_versions/*') from software_versions_yaml.collect()
+    file workflow_summary from create_workflow_summary(summary)
+
+    output:
+    file "*multiqc_report.html" into multiqc_report
+    file "*_data"
+    file "multiqc_plots"
+
+    when:
+    params.reads
+
+    script:
+    rtitle = custom_runName ? "--title \"$custom_runName\"" : ''
+    rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
+    // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
+    """
+    multiqc -f $rtitle $rfilename --config $multiqc_config .
+    """
+}
+
+/*
+ * FASTP
+ */
+process fastp {
+    publishDir "${params.outdir}/fastp/${sample_id}", mode: 'copy'
+
+    input:
+    tuple(sample_id, path(reads)) from read_files_trimming
+
+    output:
+    tuple(sample_id, path("trim*")) into unicycler_ch
+
+    when:
+    params.reads
+
+    script:
+    if (params.singleEnd)
+        """
+        fastp -i ${reads[0]} -o trim_${reads[0]} -w ${task.cpus} --json ${sample_id}_fastp.json --html ${sample_id}_fastp.html
+        """
+    else
+        """
+        fastp -i ${reads[0]} -I ${reads[1]} -o trim_${reads[0]} -O trim_${reads[1]} -w ${task.cpus} --json ${sample_id}_fastp.json --html ${sample_id}_fastp.html
+        """
+}
+
+/*
+ * UNICYCLER
+ */
+process unicycler {
+    label "process_high"
+    tag "${sample_id}"
+    publishDir "${params.outdir}/unicycler/${sample_id}", mode: 'copy'
+
+    input:
+    tuple(sample_id, path(reads)) from unicycler_ch
+
+    output:
+    path("${sample_id}_assembly.fasta") into assembled_ch
+    path("${sample_id}_assembly.gfa")
+    path("${sample_id}_unicycler.log")
+
+    when:
+    params.reads
+
+    script:
+    if (params.singleEnd)
+        """
+        unicycler --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o . -s ${reads[0]}
+        cp unicycler.log ${sample_id}_unicycler.log
+        cp assembly.gfa ${sample_id}_assembly.gfa
+        cp assembly.fasta ${sample_id}_assembly.fasta
+        """
+    else
+        """
+        unicycler --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o . -1 ${reads[0]} -2 ${reads[1]}
+        cp unicycler.log ${sample_id}_unicycler.log
+        cp assembly.gfa ${sample_id}_assembly.gfa
+        cp assembly.fasta ${sample_id}_assembly.fasta
+        """
+
+}
+
+/*
  * ABRICATE
  */
 process abricate {
     publishDir "${params.outdir}/abricate/${file(fasta).getBaseName()}", mode: 'copy'
 
     input:
-    path(fasta) from asm_ch
+    path(fasta) from asm_ch.mix(assembled_ch)
 
     output:
     tuple(path(fasta), path("plm_genes.txt")) into amr_ch
