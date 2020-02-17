@@ -27,6 +27,7 @@ def helpMessage() {
 
     Options:
       --reads                       Path to reads if need to assemble
+      --skip_asm                    skip assembly and just run quality control
       --unicycler_args              Extra Unicycler arguments
       --genome                      Name of iGenomes reference
       --singleEnd                   Specifies that the input is single end reads
@@ -219,36 +220,6 @@ process fastqc {
 }
 
 /*
- * STEP 2 - MultiQC
- */
-process multiqc {
-    publishDir "${params.outdir}/MultiQC", mode: 'copy'
-
-    input:
-    file multiqc_config from ch_multiqc_config
-    // TODO nf-core: Add in log files from your new processes for MultiQC to find!
-    file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
-    file ('software_versions/*') from software_versions_yaml.collect()
-    file workflow_summary from create_workflow_summary(summary)
-
-    output:
-    file "*multiqc_report.html" into multiqc_report
-    file "*_data"
-    file "multiqc_plots"
-
-    when:
-    params.reads
-
-    script:
-    rtitle = custom_runName ? "--title \"$custom_runName\"" : ''
-    rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
-    // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
-    """
-    multiqc -f $rtitle $rfilename --config $multiqc_config .
-    """
-}
-
-/*
  * FASTP
  */
 process fastp {
@@ -259,6 +230,8 @@ process fastp {
 
     output:
     tuple(sample_id, path("trim*")) into unicycler_ch
+    path("*.html")
+    path("*.json") into fastp_results
 
     when:
     params.reads
@@ -274,86 +247,138 @@ process fastp {
         """
 }
 
+if (!params.skip_asm) {
+    /*
+     * UNICYCLER
+     */
+    process unicycler {
+        label "process_high"
+        tag "${sample_id}"
+        publishDir "${params.outdir}/unicycler/${sample_id}", mode: 'copy'
+    
+        input:
+        tuple(sample_id, path(reads)) from unicycler_ch
+    
+        output:
+        path("${sample_id}_assembly.fasta") into assembled_ch
+        tuple (sample_id, path ("${sample_id}_assembly.fasta")) into quast_ch
+        path("${sample_id}_assembly.gfa")
+        path("${sample_id}_unicycler.log")
+    
+        when:
+        params.reads
+    
+        script:
+        if (params.singleEnd)
+            """
+            unicycler --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o . -s ${reads[0]}
+            cp unicycler.log ${sample_id}_unicycler.log
+            cp assembly.gfa ${sample_id}_assembly.gfa
+            cp assembly.fasta ${sample_id}_assembly.fasta
+            """
+        else
+            """
+            unicycler --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o . -1 ${reads[0]} -2 ${reads[1]}
+            cp unicycler.log ${sample_id}_unicycler.log
+            cp assembly.gfa ${sample_id}_assembly.gfa
+            cp assembly.fasta ${sample_id}_assembly.fasta
+            """
+    
+    }
+
+    process quast {
+        publishDir "${params.outdir}/QUAST/${sample_id}", mode: 'copy'
+
+        input:
+        tuple (sample_id, path(assembly)) from quast_ch
+
+        output:
+        path("quast/*") into quast_output
+
+        script:
+        """
+        quast -o quast $assembly
+        """
+    }
+
+
+
+    /*
+     * ABRICATE
+     */
+    process abricate {
+        publishDir "${params.outdir}/abricate/${file(fasta).getBaseName()}", mode: 'copy'
+    
+        input:
+        path(fasta) from asm_ch.mix(assembled_ch)
+    
+        output:
+        tuple(path(fasta), path("plm_genes.txt")) into amr_ch
+    
+        script:
+        """
+        abricate --threads ${task.cpus} $fasta --db ncbi > ${file(fasta).getBaseName()}.amr.tab
+        cat ${file(fasta).getBaseName()}.amr.tab | awk 'FNR > 1 { print \$6}' > plm_genes.txt
+        """
+        
+    }
+    
+    process sort_genes {
+        publishDir "${params.outdir}/genes", mode: 'copy'
+    
+        input:
+        tuple(path(fasta), path(genes)) from amr_ch
+        
+        output:
+        path("*/*.fasta")
+    
+        script:
+        if (genes.empty())
+            """
+            mkdir -p no_AMR
+            cp $fasta no_AMR/
+            """
+        else
+            """
+            while read p 
+            do 
+            mkdir -p \$p 
+            cp ${fasta} \$p 
+            done < ${genes}
+            """
+    }
+}
+
 /*
- * UNICYCLER
+ * STEP 2 - MultiQC
  */
-process unicycler {
-    label "process_high"
-    tag "${sample_id}"
-    publishDir "${params.outdir}/unicycler/${sample_id}", mode: 'copy'
+process multiqc {
+    publishDir "${params.outdir}/MultiQC", mode: 'copy'
 
     input:
-    tuple(sample_id, path(reads)) from unicycler_ch
+    file multiqc_config from ch_multiqc_config
+    // TODO nf-core: Add in log files from your new processes for MultiQC to find!
+    file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
+    file ('software_versions/*') from software_versions_yaml.collect()
+    file workflow_summary from create_workflow_summary(summary)
+    path("fastp/*/*.json") from fastp_results.collect().ifEmpty([])
+    path("quast/*") from quast_output.collect().ifEmpty([])
 
     output:
-    path("${sample_id}_assembly.fasta") into assembled_ch
-    path("${sample_id}_assembly.gfa")
-    path("${sample_id}_unicycler.log")
+    file "*multiqc_report.html" into multiqc_report
+    file "*_data"
+    file "multiqc_plots"
 
     when:
     params.reads
 
     script:
-    if (params.singleEnd)
-        """
-        unicycler --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o . -s ${reads[0]}
-        cp unicycler.log ${sample_id}_unicycler.log
-        cp assembly.gfa ${sample_id}_assembly.gfa
-        cp assembly.fasta ${sample_id}_assembly.fasta
-        """
-    else
-        """
-        unicycler --threads ${task.cpus} ${params.unicycler_args} --keep 0 -o . -1 ${reads[0]} -2 ${reads[1]}
-        cp unicycler.log ${sample_id}_unicycler.log
-        cp assembly.gfa ${sample_id}_assembly.gfa
-        cp assembly.fasta ${sample_id}_assembly.fasta
-        """
-
-}
-
-/*
- * ABRICATE
- */
-process abricate {
-    publishDir "${params.outdir}/abricate/${file(fasta).getBaseName()}", mode: 'copy'
-
-    input:
-    path(fasta) from asm_ch.mix(assembled_ch)
-
-    output:
-    tuple(path(fasta), path("plm_genes.txt")) into amr_ch
-
-    script:
+    rtitle = custom_runName ? "--title \"$custom_runName\"" : ''
+    rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
+    // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
     """
-    abricate --threads ${task.cpus} $fasta --db ncbi > ${file(fasta).getBaseName()}.amr.tab
-    cat ${file(fasta).getBaseName()}.amr.tab | awk 'FNR > 1 { print \$6}' > plm_genes.txt
+    multiqc -f $rtitle $rfilename --config $multiqc_config . fastp/*/* quast/*
     """
-    
-}
-
-process sort_genes {
-    publishDir "${params.outdir}/genes", mode: 'copy'
-
-    input:
-    tuple(path(fasta), path(genes)) from amr_ch
-    
-    output:
-    path("*/*.fasta")
-
-    script:
-    if (genes.empty())
-        """
-        mkdir -p no_AMR
-        cp $fasta no_AMR/
-        """
-    else
-        """
-        while read p 
-        do 
-        mkdir -p \$p 
-        cp ${fasta} \$p 
-        done < ${genes}
-        """
 }
 
 /*
